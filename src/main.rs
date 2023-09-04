@@ -1,12 +1,13 @@
 use clap::Parser;
 use sha2::{Sha256, Digest};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use rayon::prelude::*;
 
 #[derive(Parser, Debug)]
 struct Config {
-    #[arg(short = 'N', long)]
+    #[arg(short = 'N', long, default_value_t = 0)]
     nulls: usize,
-    #[arg(short = 'F', long)]
+    #[arg(short = 'F', long, default_value_t = 3)]
     find: usize
 }
 
@@ -31,22 +32,60 @@ fn check_zeros(v: &[u8], target: usize) -> bool {
 fn main() {
     let args = Config::parse();
 
-    let mut found = Vec::new();
-    let mut i: usize = 1;
-    while found.len() < args.find {
-        let mut hasher = Sha256::new();
-        hasher.update(i.to_string().into_bytes());
-        let result = hasher.finalize();
+    let cpus = num_cpus::get();
+    let (task_sender, task_receiver) = crossbeam::channel::unbounded();
+    let (result_sender, result_receiver) = crossbeam::channel::unbounded();
 
-        if check_zeros(&result, args.nulls) {
-            found.push((i, result));
-        }
-        i += 1;
+    let work_range = 1..cpus;
+    for i in work_range.clone() {
+        task_sender.send(Some(i)).unwrap();
     }
+    let mut i = cpus;
 
-    for (i, v) in found {
-        println!("{} {:?}", i, v);
-    }
+    let receivers: Vec<_> = work_range.map(|_| (task_receiver.clone(), result_sender.clone())).collect();
+    drop(task_receiver);
+    drop(result_sender);
+
+    rayon::join(move || {
+        let mut found = BTreeMap::new();
+            while let Ok(result) = result_receiver.recv() {
+                if let Some((key, value)) = result {
+                    found.insert(key, value);
+                }
+                if found.len() >= args.find {
+                    task_sender.send(None).unwrap();
+                } else {
+                    task_sender.send(Some(i)).unwrap();
+                    i += 1;
+                }
+            }
+            drop(result_receiver);
+
+            for (i, (number, hash)) in found.into_iter().enumerate() {
+                if i < args.find {
+                    println!("{}, \"{}\"", number, hex::encode(hash));
+                } else {
+                    break;
+                }
+            }
+        },
+        move ||
+        receivers.par_iter().for_each(|(task, result)| {
+            while let Ok(Some(i)) = task.recv() {
+                let mut hasher = Sha256::new();
+                hasher.update(i.to_string().into_bytes());
+                let hash = hasher.finalize();
+
+                if check_zeros(&hash, args.nulls) {
+                    if let Err(e) = result.send(Some((i, hash))) {
+                        println!("{}", e);
+                    }
+                } else if let Err(e) = result.send(None) {
+                    println!("{}", e);
+                }
+            }
+        })
+    );
 }
 
 
