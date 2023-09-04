@@ -1,41 +1,34 @@
+//! Program to print integers, such that their hashes have suffix of nulls of given length, with
+//! corresponding hashes.
+//!
+#![warn(missing_docs)]
 use clap::Parser;
 use sha2::{Sha256, Digest};
 use std::collections::BTreeMap;
 use rayon::prelude::*;
 
-#[derive(Parser, Debug)]
-struct Config {
-    #[arg(short = 'N', long, default_value_t = 0)]
-    nulls: usize,
-    #[arg(short = 'F', long, default_value_t = 3)]
-    find: usize
-}
+mod utils;
+use crate::utils::check_zeros;
 
-fn check_zeros(v: &[u8], target: usize) -> bool {
-    let mut zeros = 0;
-    for &i in v.iter().rev() {
-        if i == 0 {
-            zeros += 2;
-        } else {
-            if i & 0x0f == 0 {
-                zeros += 1;
-            }
-            break;
-        }
-        if zeros >= target {
-            break;
-        }
-    }
-    zeros >= target
-}
+mod config;
+use crate::config::Args;
 
+/// The main function that makes the work done.
+///
+/// It utilizes rayon to start worker threads that calculate hashes and manager thread that
+/// feeds them as they make progress. Multi-sender-multi-consumer channels from crossbeam are used to
+/// simplify synchronization.
 fn main() {
-    let args = Config::parse();
+    let args = Args::parse();
 
     let cpus = num_cpus::get();
+    // task channel is used to feed workers
     let (task_sender, task_receiver) = crossbeam::channel::unbounded();
+    // result channel is used to get results
     let (result_sender, result_receiver) = crossbeam::channel::unbounded();
 
+    // work range includes (cpus - 1) elements to allow manager thread to be active simultaneously
+    // with worker threads (in the best case)
     let work_range = 1..cpus;
     for i in work_range.clone() {
         task_sender.send(Some(i)).unwrap();
@@ -46,8 +39,9 @@ fn main() {
     drop(task_receiver);
     drop(result_sender);
 
-    rayon::join(move || {
-        let mut found = BTreeMap::new();
+    rayon::join(
+        move || {
+            let mut found = BTreeMap::new();
             while let Ok(result) = result_receiver.recv() {
                 if let Some((key, value)) = result {
                     found.insert(key, value);
@@ -86,26 +80,4 @@ fn main() {
             }
         })
     );
-}
-
-
-#[cfg(test)]
-mod tests{
-    use hex_literal::hex;
-    use crate::check_zeros;
-
-    #[test]
-    fn checker() {
-        let h = hex!("95d4362bd3cd4315d0bbe38dfa5d7fb8f0aed5f1a31d98d510907279194e3000");
-        assert!(check_zeros(&h, 3));
-        assert!(!check_zeros(&h, 5));
-
-        let h = hex!("0000000000000000000000000000000000000000000000000000000000000000");
-        assert!(check_zeros(&h, 1));
-        assert!(check_zeros(&h, 0));
-
-        let h = hex!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        assert!(!check_zeros(&h, 1));
-        assert!(check_zeros(&h, 0));
-    }
 }
